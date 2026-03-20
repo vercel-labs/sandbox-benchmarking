@@ -59,9 +59,9 @@ The penalty varies:
 
 `runCommand()` with the default `wait: true` holds the HTTP connection open (NDJSON streaming) until the command exits. The first command blocks server-side while the VM finishes booting.
 
-## Snapshot Restore Is the Worst Case
+## Snapshot Restore Has a Consistent Boot Penalty
 
-The penalty is **worse for snapshot restore than fresh create**:
+The penalty is present on **every** snapshot restore:
 
 | Source | Create time | 1st cmd | 2nd cmd | Penalty |
 |--------|------------|---------|---------|---------|
@@ -69,6 +69,17 @@ The penalty is **worse for snapshot restore than fresh create**:
 | **1st snapshot restore** | **2.1s** | **32,919ms** | **293ms** | **112x** |
 | 2nd snapshot restore | 1.5s | 1,553ms | 207ms | 7.5x |
 | 3rd snapshot restore | 1.5s | 2,161ms | 226ms | 9.6x |
+
+**Note:** Cycles 2-3 appear faster because they ran seconds apart, benefiting from
+warm infrastructure. In production (restores separated by minutes/hours), every
+restore shows a consistent **~6 second** first-command penalty:
+
+```
+Production restore metrics (each separated by real stop/restore cycles):
+  Restore 1: runCommand=11,880ms, gateway boot=5,689ms → 6.2s overhead
+  Restore 2: runCommand=11,691ms, gateway boot=6,089ms → 5.6s overhead
+  Restore 3: runCommand=11,969ms, gateway boot=6,014ms → 6.0s overhead
+```
 
 Fresh create takes longer to return (271s) but the VM is mostly ready when it does.
 Snapshot restore returns fast (2s) but the VM isn't ready — the first command pays the full boot cost.
