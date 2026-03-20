@@ -1,17 +1,88 @@
 # Sandbox First-Command Boot Penalty
 
-Minimal reproduction showing that the first `runCommand` after `Sandbox.create()` has a **7-112x latency penalty** compared to subsequent commands on the same sandbox.
+Minimal reproduction showing that the first `runCommand` after `Sandbox.create()` takes **seconds** even for trivial commands, while subsequent commands take **milliseconds**.
 
 ## The Issue
 
-```
-Sandbox.create():  1,500ms   (status: "running")
-1st runCommand:    32,919ms  (echo hello)  ← 112x slower
-2nd runCommand:    293ms     (echo hello)
-3rd runCommand:    230ms     (exit 0)
+```typescript
+const sandbox = await Sandbox.create({
+  source: { type: "snapshot", snapshotId },
+  ports: [3000],
+  timeout: 60_000,
+  resources: { vcpus: 1 },
+});
+// ✅ create() resolves in ~1.5s, status is "running"
+
+const t1 = Date.now();
+await sandbox.runCommand("echo", ["hello"]);
+console.log(Date.now() - t1);
+// ❌ 6,480ms — just to echo "hello"
+//    The VM is still booting. The command waits server-side.
+
+const t2 = Date.now();
+await sandbox.runCommand("echo", ["hello"]);
+console.log(Date.now() - t2);
+// ✅ 207ms — VM is ready now. This is the expected speed.
 ```
 
-`Sandbox.create()` resolves before the VM is fully ready. The first command absorbs the remaining boot time. Subsequent commands are fast (~200ms).
+## The First-Command Penalty
+
+`Sandbox.create()` resolves before the VM is fully ready. The first `runCommand` absorbs the remaining boot time. Every subsequent command is fast.
+
+**Benchmark (snapshot restores, local machine):**
+
+```typescript
+// Each cycle creates a NEW sandbox from the same snapshot
+
+// Cycle 1 — cold infrastructure
+await Sandbox.create(...)          // 2,057ms — fast return
+await sandbox.runCommand("echo")   // 32,919ms ← 😱 33 seconds for echo
+await sandbox.runCommand("echo")   // 293ms    ← normal
+
+// Cycle 2 — warm infrastructure (ran seconds after cycle 1)
+await Sandbox.create(...)          // 1,500ms
+await sandbox.runCommand("echo")   // 1,553ms  ← still 7.5x slower than 2nd
+await sandbox.runCommand("echo")   // 207ms    ← normal
+
+// Cycle 3
+await Sandbox.create(...)          // 1,506ms
+await sandbox.runCommand("echo")   // 2,161ms  ← still 9.6x slower than 2nd
+await sandbox.runCommand("echo")   // 226ms    ← normal
+```
+
+**Production (Vercel function, restores separated by minutes):**
+
+```typescript
+// Every restore pays the full penalty — no warm infrastructure benefit
+
+await Sandbox.create(...)          // 1,200ms
+await sandbox.runCommand("bash", [script])
+// Wall clock:     11,880ms
+// In-sandbox time: 5,689ms  (measured by the script itself)
+// VM boot penalty: 6,191ms  ← dead time before script starts executing
+```
+
+The production penalty is **~6 seconds on every restore**, consistently.
+
+## Our Use Case
+
+We run [OpenClaw](https://openclaw.ai) in a Vercel Sandbox. The sandbox sleeps after inactivity. When a user sends a message, we restore from snapshot:
+
+```typescript
+// What our restore looks like today:
+const sandbox = await Sandbox.create({ source: { type: "snapshot", snapshotId } });
+//                                      1.5s ✅
+
+await sandbox.runCommand("bash", [startupScript]);
+//   Total wall clock: 12s
+//   Actual script work: 6s (gateway booting)
+//   VM boot penalty:    6s (waiting for VM to accept commands)
+//                       ^^^ This is the problem
+
+// If create() waited for VM readiness:
+//   Total wall clock: ~6s (just the actual gateway boot)
+//   Saved: 6 seconds per restore
+```
 
 ## Setup
 
@@ -27,84 +98,38 @@ vercel env pull    # downloads OIDC credentials to .env.local
 node bench.mjs
 ```
 
-## Expected Output
-
-```
-=== Snapshot Restore ===
-
-Sandbox.create():  1500ms  (from snapshot, status: running)
-1st runCommand:    6480ms  (echo hello)     ← BOOT PENALTY
-2nd runCommand:    207ms   (echo hello)
-3rd runCommand:    184ms   (exit 0)
-
-Penalty ratio:     31.3x  (1st / 2nd)
-```
-
-The penalty varies:
-- **First restore after fresh snapshot**: 7-33 seconds (worst case)
-- **Subsequent restores**: 1.5-6.5 seconds
-- **2nd+ commands on same sandbox**: 60-300ms (expected)
-
-## What the Benchmark Does
-
-1. Creates a fresh sandbox (no snapshot)
-2. Measures 3 sequential `runCommand` calls
-3. Snapshots the sandbox
-4. Restores from snapshot 3 times, measuring each `runCommand`
-5. Reports the penalty ratio (1st command / 2nd command)
-
 ## SDK Source Context
 
-`Sandbox.create()` does a single POST to `/v1/sandboxes` and returns when the API responds — it does **not** poll for VM readiness or wait for `status: "running"` to mean "VM is accepting commands."
+Looking at the SDK source (`@vercel/sandbox` v1.8.1):
 
-`runCommand()` with the default `wait: true` holds the HTTP connection open (NDJSON streaming) until the command exits. The first command blocks server-side while the VM finishes booting.
-
-## The First-Command Penalty
-
-After `Sandbox.create()` resolves, the first `runCommand` consistently takes **seconds** — even for `echo hello`. The second command on the same sandbox takes **milliseconds**.
-
-This happens on every snapshot restore. The VM isn't fully ready when `create()` returns. The first command absorbs the remaining boot time.
-
-**Benchmark (local, back-to-back restores):**
-
-| | Create | 1st cmd (`echo hello`) | 2nd cmd (`echo hello`) |
-|---|--------|----------------------|----------------------|
-| Restore 1 | 2.1s | **32.9s** | 293ms |
-| Restore 2 | 1.5s | **1.6s** | 207ms |
-| Restore 3 | 1.5s | **2.2s** | 226ms |
-
-**Production (restores separated by minutes, from a Vercel function):**
-
-| | Create | 1st cmd (startup script) | In-sandbox boot |
-|---|--------|------------------------|-----------------|
-| Restore 1 | 1.2s | **11.9s** | 5.7s |
-| Restore 2 | 1.5s | **11.7s** | 6.1s |
-| Restore 3 | 1.4s | **12.0s** | 6.0s |
-
-In production, the first command takes ~12s but the actual work inside the sandbox (gateway boot) only takes ~6s. The other ~6s is the VM finishing its initialization before the command can start executing.
-
-## Our Use Case
-
-We run [OpenClaw](https://openclaw.ai) in a Vercel Sandbox for a chat application. The sandbox sleeps after 30 minutes of inactivity to save costs. When a user sends a message (via Slack, Telegram, Discord, or the web UI), we restore from snapshot and start the gateway.
-
-**The first-command penalty is the dominant factor in user-perceived restore latency:**
-
-```
-User sends message
-  → Sandbox.create (snapshot restore):  1.5s   ← fast
-  → runCommand (start gateway):         6-33s  ← BOOT PENALTY
-  → Gateway serves first response:      ~0.2s
-  → Total wait:                         8-35s
+```javascript
+// sandbox.js — create() is a single API call, no readiness polling
+static async create(params) {
+  const client = new APIClient({ ... });
+  const sandbox = await client.createSandbox({ ... });
+  //              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  //              Single POST to /v1/sandboxes
+  //              Returns as soon as API responds
+  //              Does NOT poll for VM readiness
+  return new DisposableSandbox({ client, sandbox, routes });
+}
 ```
 
-Without the penalty, restore would be:
-```
-  → Sandbox.create:                     1.5s
-  → runCommand (start gateway):         ~3.7s  (actual gateway boot)
-  → Total wait:                         ~5.2s
+```javascript
+// api-client.js — runCommand holds the connection open until exit
+async runCommand(params) {
+  const response = await this.request(`/v1/sandboxes/${id}/cmd`, {
+    method: "POST",
+    body: JSON.stringify({ command, args, wait: true }),
+  });
+  // Response is NDJSON stream:
+  //   chunk 1: command started (after VM is ready)
+  //            ^^^ THIS IS WHERE THE WAIT HAPPENS
+  //   chunk 2: command finished
+}
 ```
 
-The penalty adds 3-30 seconds of dead time where the command is queued server-side waiting for the VM to finish initializing.
+The server queues the command and waits for the VM to be ready before executing. That wait is invisible to the caller — it just looks like a slow `runCommand`.
 
 ## Environment
 
