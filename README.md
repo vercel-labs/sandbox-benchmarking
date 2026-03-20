@@ -88,15 +88,28 @@ await sandbox.runCommand("bash", [startupScript]);
 
 ```bash
 npm install
-vercel link        # link to any Vercel project with Sandbox access
-vercel env pull    # downloads OIDC credentials to .env.local
+vercel link
+vercel env pull
 ```
 
-## Run
+## Run Locally
 
 ```bash
 node bench.mjs
 ```
+
+## Run from a Vercel Function
+
+Deploy the API route and hit it — this proves the penalty is worse from inside a Vercel function:
+
+```bash
+vercel deploy --prod
+curl https://YOUR_DEPLOYMENT.vercel.app/api/bench
+```
+
+The `/api/bench` endpoint runs the exact same benchmark from a Vercel function (iad1 region, same as sandboxes) and returns JSON with all timings.
+
+Compare the output to `node bench.mjs` — the first-command penalty is significantly larger from a Vercel function than from a local machine.
 
 ## SDK Source Context
 
