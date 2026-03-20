@@ -59,30 +59,29 @@ The penalty varies:
 
 `runCommand()` with the default `wait: true` holds the HTTP connection open (NDJSON streaming) until the command exits. The first command blocks server-side while the VM finishes booting.
 
-## Snapshot Restore Has a Consistent Boot Penalty
+## The First-Command Penalty
 
-The penalty is present on **every** snapshot restore:
+After `Sandbox.create()` resolves, the first `runCommand` consistently takes **seconds** — even for `echo hello`. The second command on the same sandbox takes **milliseconds**.
 
-| Source | Create time | 1st cmd | 2nd cmd | Penalty |
-|--------|------------|---------|---------|---------|
-| Fresh create | 271s | 889ms | 287ms | 3.1x |
-| **1st snapshot restore** | **2.1s** | **32,919ms** | **293ms** | **112x** |
-| 2nd snapshot restore | 1.5s | 1,553ms | 207ms | 7.5x |
-| 3rd snapshot restore | 1.5s | 2,161ms | 226ms | 9.6x |
+This happens on every snapshot restore. The VM isn't fully ready when `create()` returns. The first command absorbs the remaining boot time.
 
-**Note:** Cycles 2-3 appear faster because they ran seconds apart, benefiting from
-warm infrastructure. In production (restores separated by minutes/hours), every
-restore shows a consistent **~6 second** first-command penalty:
+**Benchmark (local, back-to-back restores):**
 
-```
-Production restore metrics (each separated by real stop/restore cycles):
-  Restore 1: runCommand=11,880ms, gateway boot=5,689ms → 6.2s overhead
-  Restore 2: runCommand=11,691ms, gateway boot=6,089ms → 5.6s overhead
-  Restore 3: runCommand=11,969ms, gateway boot=6,014ms → 6.0s overhead
-```
+| | Create | 1st cmd (`echo hello`) | 2nd cmd (`echo hello`) |
+|---|--------|----------------------|----------------------|
+| Restore 1 | 2.1s | **32.9s** | 293ms |
+| Restore 2 | 1.5s | **1.6s** | 207ms |
+| Restore 3 | 1.5s | **2.2s** | 226ms |
 
-Fresh create takes longer to return (271s) but the VM is mostly ready when it does.
-Snapshot restore returns fast (2s) but the VM isn't ready — the first command pays the full boot cost.
+**Production (restores separated by minutes, from a Vercel function):**
+
+| | Create | 1st cmd (startup script) | In-sandbox boot |
+|---|--------|------------------------|-----------------|
+| Restore 1 | 1.2s | **11.9s** | 5.7s |
+| Restore 2 | 1.5s | **11.7s** | 6.1s |
+| Restore 3 | 1.4s | **12.0s** | 6.0s |
+
+In production, the first command takes ~12s but the actual work inside the sandbox (gateway boot) only takes ~6s. The other ~6s is the VM finishing its initialization before the command can start executing.
 
 ## Our Use Case
 
