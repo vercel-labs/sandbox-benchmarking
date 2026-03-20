@@ -59,6 +59,43 @@ The penalty varies:
 
 `runCommand()` with the default `wait: true` holds the HTTP connection open (NDJSON streaming) until the command exits. The first command blocks server-side while the VM finishes booting.
 
+## Snapshot Restore Is the Worst Case
+
+The penalty is **worse for snapshot restore than fresh create**:
+
+| Source | Create time | 1st cmd | 2nd cmd | Penalty |
+|--------|------------|---------|---------|---------|
+| Fresh create | 271s | 889ms | 287ms | 3.1x |
+| **1st snapshot restore** | **2.1s** | **32,919ms** | **293ms** | **112x** |
+| 2nd snapshot restore | 1.5s | 1,553ms | 207ms | 7.5x |
+| 3rd snapshot restore | 1.5s | 2,161ms | 226ms | 9.6x |
+
+Fresh create takes longer to return (271s) but the VM is mostly ready when it does.
+Snapshot restore returns fast (2s) but the VM isn't ready — the first command pays the full boot cost.
+
+## Our Use Case
+
+We run [OpenClaw](https://openclaw.ai) in a Vercel Sandbox for a chat application. The sandbox sleeps after 30 minutes of inactivity to save costs. When a user sends a message (via Slack, Telegram, Discord, or the web UI), we restore from snapshot and start the gateway.
+
+**The first-command penalty is the dominant factor in user-perceived restore latency:**
+
+```
+User sends message
+  → Sandbox.create (snapshot restore):  1.5s   ← fast
+  → runCommand (start gateway):         6-33s  ← BOOT PENALTY
+  → Gateway serves first response:      ~0.2s
+  → Total wait:                         8-35s
+```
+
+Without the penalty, restore would be:
+```
+  → Sandbox.create:                     1.5s
+  → runCommand (start gateway):         ~3.7s  (actual gateway boot)
+  → Total wait:                         ~5.2s
+```
+
+The penalty adds 3-30 seconds of dead time where the command is queued server-side waiting for the VM to finish initializing.
+
 ## Environment
 
 - `@vercel/sandbox`: 1.8.1
