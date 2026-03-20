@@ -131,6 +131,18 @@ async runCommand(params) {
 
 The server queues the command and waits for the VM to be ready before executing. That wait is invisible to the caller — it just looks like a slow `runCommand`.
 
+## Docs vs Measured Reality
+
+The current docs make three performance claims that conflict with our measurements:
+
+| Docs claim | Source | Measured |
+|-----------|--------|---------|
+| "Startup time: Milliseconds" | [Concepts: Sandboxes vs containers](https://vercel.com/docs/vercel-sandbox/concepts) | First command after create: **1.5-33 seconds** |
+| "Warm start: 0.41s" | [KB: Snapshots for faster startup](https://vercel.com/kb/guide/how-to-use-snapshots-for-faster-sandbox-startup) | `create()` is 0.41s, but first `runCommand` adds **1.5-33s** on top |
+| "Resuming from a snapshot is even faster" | [Concepts: How sandboxes work](https://vercel.com/docs/vercel-sandbox/concepts) | Snapshot restore first-command penalty (**7-112x**) is worse than fresh create (**3.1x**) |
+
+The "warm start: 0.41s" measures only `Sandbox.create()` — it does not include the first `runCommand`, which is where users actually interact with the sandbox. A developer reading "0.41s warm start" would expect to run commands in under a second.
+
 ## Environment
 
 - `@vercel/sandbox`: 1.8.1
