@@ -1,0 +1,11 @@
+{
+  "name": "sandbox-benchmarking",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "bench": "node bench.mjs"
+  },
+  "dependencies": {
+    "@vercel/sandbox": "^1.8.1"
+  }
+}
